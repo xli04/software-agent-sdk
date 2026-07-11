@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.request import urlopen
 
 import httpx
 import tenacity
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, SecretStr
 
 from openhands.sdk.logger import get_logger
+from openhands.sdk.mcp.config import MCPServer, MCPTransport
 from openhands.sdk.workspace.remote.base import RemoteWorkspace
+from openhands.sdk.workspace.repo import CloneResult, RepoMapping, RepoSource
 
 
 if TYPE_CHECKING:
+    from openhands.sdk.context import AgentContext
     from openhands.sdk.llm.llm import LLM
     from openhands.sdk.secret import LookupSecret
+    from openhands.sdk.skills import Skill
 
 
 logger = get_logger(__name__)
@@ -30,6 +36,12 @@ _MAX_RETRIES = 3
 
 # Default port the agent-server listens on inside a Cloud Runtime
 DEFAULT_AGENT_SERVER_PORT = 60000
+
+
+def _mcp_api_key_headers(api_key: object) -> dict[str, SecretStr] | None:
+    if not api_key:
+        return None
+    return {"Authorization": SecretStr(f"Bearer {api_key}")}
 
 
 def _is_retryable_error(error: BaseException) -> bool:
@@ -146,6 +158,7 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
     _exposed_urls: list[dict[str, Any]] | None = PrivateAttr(default=None)
     _automation_callback_url: str | None = PrivateAttr(default=None)
     _automation_run_id: str | None = PrivateAttr(default=None)
+    _conversation_id: str | None = PrivateAttr(default=None)
 
     @property
     def default_conversation_tags(self) -> dict[str, str]:
@@ -564,15 +577,17 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
         retry=tenacity.retry_if_exception(_is_retryable_error),
         reraise=True,
     )
-    def get_llm(self, **llm_kwargs: Any) -> LLM:
+    def get_llm(self, profile_name: str | None = None, **llm_kwargs: Any) -> LLM:
         """Fetch LLM settings from the user's SaaS account and return an LLM.
 
         Calls ``GET /api/v1/users/me?expose_secrets=true`` to retrieve the
-        user's LLM configuration (model, api_key, base_url) and returns a
-        fully usable ``LLM`` instance.  Retries up to 3 times on transient
-        errors (network issues, server 5xx).
+        user's LLM configuration or a named LLM profile and returns a fully
+        usable ``LLM`` instance. Retries up to 3 times on transient errors
+        (network issues, server 5xx).
 
         Args:
+            profile_name: Optional LLM profile name. When provided, loads that
+                named profile instead of the default SaaS LLM fields.
             **llm_kwargs: Additional keyword arguments passed to the LLM
                 constructor, allowing overrides of any LLM parameter
                 (e.g. ``model``, ``temperature``).
@@ -581,12 +596,13 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
             An LLM instance configured with the user's SaaS credentials.
 
         Raises:
+            FileNotFoundError: If ``profile_name`` does not exist.
             httpx.HTTPStatusError: If the API request fails.
             RuntimeError: If the sandbox is not running.
 
         Example:
             >>> with OpenHandsCloudWorkspace(...) as workspace:
-            ...     llm = workspace.get_llm()
+            ...     llm = workspace.get_llm(profile_name="fast")
             ...     agent = Agent(llm=llm, tools=get_default_tools())
         """
         from openhands.sdk.llm.llm import LLM
@@ -602,13 +618,28 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
         )
         data = resp.json()
 
-        kwargs: dict[str, Any] = {}
-        if data.get("llm_model"):
-            kwargs["model"] = data["llm_model"]
-        if data.get("llm_api_key"):
-            kwargs["api_key"] = data["llm_api_key"]
-        if data.get("llm_base_url"):
-            kwargs["base_url"] = data["llm_base_url"]
+        if profile_name:
+            profiles_payload = data.get("llm_profiles") or {}
+            profiles = (
+                profiles_payload.get("profiles")
+                if isinstance(profiles_payload, dict)
+                else None
+            )
+            profile_config = (
+                profiles.get(profile_name) if isinstance(profiles, dict) else None
+            )
+            if not isinstance(profile_config, dict):
+                raise FileNotFoundError(f"LLM profile '{profile_name}' not found")
+            kwargs = dict(profile_config)
+            kwargs["usage_id"] = f"profile:{profile_name}"
+        else:
+            kwargs = {}
+            if data.get("llm_model"):
+                kwargs["model"] = data["llm_model"]
+            if data.get("llm_api_key"):
+                kwargs["api_key"] = data["llm_api_key"]
+            if data.get("llm_base_url"):
+                kwargs["base_url"] = data["llm_base_url"]
 
         # User-provided kwargs take precedence
         kwargs.update(llm_kwargs)
@@ -673,17 +704,15 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
         retry=tenacity.retry_if_exception(_is_retryable_error),
         reraise=True,
     )
-    def get_mcp_config(self) -> dict[str, Any]:
-        """Fetch MCP configuration from the user's SaaS account.
+    def get_mcp_config(self) -> dict[str, MCPServer]:
+        """Fetch MCP servers from the user's SaaS account.
 
         Calls ``GET /api/v1/users/me`` to retrieve the user's MCP configuration
-        and transforms it into the format expected by the SDK Agent and
-        ``fastmcp.mcp_config.MCPConfig``.
+        and transforms it into the native server map expected by the SDK Agent.
 
         Returns:
-            A dictionary with ``mcpServers`` key containing server configurations
-            (compatible with ``MCPConfig.model_validate()``), or an empty dict
-            if no MCP config is set.
+            A dictionary mapping server names to server configurations, or an
+            empty dict if no MCP servers are configured.
 
         Raises:
             httpx.HTTPStatusError: If the API request fails.
@@ -694,10 +723,6 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
             ...     llm = workspace.get_llm()
             ...     mcp_config = workspace.get_mcp_config()
             ...     agent = Agent(llm=llm, mcp_config=mcp_config, tools=...)
-            ...
-            ...     # Or validate as MCPConfig:
-            ...     from fastmcp.mcp_config import MCPConfig
-            ...     config = MCPConfig.model_validate(mcp_config)
         """
         if not self._sandbox_id:
             raise RuntimeError("Sandbox is not running")
@@ -709,55 +734,38 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
         )
         data = resp.json()
 
-        mcp_config_data = data.get("mcp_config")
-        if not mcp_config_data:
+        cloud_mcp_config = data.get("mcp_config")
+        if not isinstance(cloud_mcp_config, Mapping):
             return {}
 
-        mcp_servers: dict[str, dict[str, Any]] = {}
+        mcp_config: dict[str, MCPServer] = {}
 
-        # Transform SSE servers → RemoteMCPServer format
-        for i, sse_server in enumerate(mcp_config_data.get("sse_servers") or []):
-            server_config: dict[str, Any] = {
-                "url": sse_server["url"],
-                "transport": "sse",
-            }
-            if sse_server.get("api_key"):
-                server_config["headers"] = {
-                    "Authorization": f"Bearer {sse_server['api_key']}"
-                }
-            server_name = f"sse_{i}"
-            mcp_servers[server_name] = server_config
+        server_sources: tuple[tuple[str, str | None, MCPTransport | None], ...] = (
+            ("sse_servers", "sse", "sse"),
+            ("shttp_servers", "shttp", "streamable-http"),
+            ("stdio_servers", None, None),
+        )
+        for source, name_prefix, transport in server_sources:
+            for index, server in enumerate(cloud_mcp_config.get(source) or []):
+                if transport is None:
+                    mcp_config[server["name"]] = MCPServer(
+                        command=server["command"],
+                        args=server.get("args", []),
+                        env=server.get("env"),
+                    )
+                    continue
 
-        # Transform SHTTP servers → RemoteMCPServer format
-        for i, shttp_server in enumerate(mcp_config_data.get("shttp_servers") or []):
-            server_config = {
-                "url": shttp_server["url"],
-                "transport": "streamable-http",
-            }
-            if shttp_server.get("api_key"):
-                server_config["headers"] = {
-                    "Authorization": f"Bearer {shttp_server['api_key']}"
-                }
-            if shttp_server.get("timeout"):
-                server_config["timeout"] = shttp_server["timeout"]
-            server_name = f"shttp_{i}"
-            mcp_servers[server_name] = server_config
+                assert name_prefix is not None
+                mcp_config[f"{name_prefix}_{index}"] = MCPServer(
+                    url=server["url"],
+                    transport=transport,
+                    headers=_mcp_api_key_headers(server.get("api_key")),
+                    timeout=server.get("timeout")
+                    if transport == "streamable-http"
+                    else None,
+                )
 
-        # Transform STDIO servers → StdioMCPServer format
-        for stdio_server in mcp_config_data.get("stdio_servers") or []:
-            server_config = {
-                "command": stdio_server["command"],
-                "args": stdio_server.get("args", []),
-            }
-            if stdio_server.get("env"):
-                server_config["env"] = stdio_server["env"]
-            # STDIO servers have an explicit name field
-            mcp_servers[stdio_server["name"]] = server_config
-
-        if not mcp_servers:
-            return {}
-
-        return {"mcpServers": mcp_servers}
+        return mcp_config
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(_MAX_RETRIES),
@@ -791,6 +799,28 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
 
         return response
 
+    def register_conversation(self, conversation_id: str) -> None:
+        """Register a conversation ID with this workspace.
+
+        Called by RemoteConversation after creation to associate the conversation
+        with the workspace. The conversation ID is included in the completion
+        callback sent to the automation service.
+
+        Args:
+            conversation_id: The conversation ID to register
+        """
+        self._conversation_id = conversation_id
+        logger.debug(f"Registered conversation: {conversation_id}")
+
+    @property
+    def conversation_id(self) -> str | None:
+        """Get the registered conversation ID.
+
+        Returns:
+            The conversation ID if one has been registered, None otherwise.
+        """
+        return self._conversation_id
+
     def __del__(self) -> None:
         self.cleanup()
 
@@ -808,6 +838,9 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
 
         Called by ``__exit__`` before ``cleanup()``.  Does nothing when
         ``AUTOMATION_CALLBACK_URL`` env var was not set.
+
+        Includes ``conversation_id`` in the payload if one was registered via
+        ``register_conversation()``.
         """
         try:
             callback_url = self._automation_callback_url
@@ -824,6 +857,10 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
         if exc_val is not None:
             payload["error"] = str(exc_val)
 
+        # Include conversation_id if one was registered
+        if self._conversation_id is not None:
+            payload["conversation_id"] = self._conversation_id
+
         try:
             headers = {"Authorization": f"Bearer {self.cloud_api_key}"}
             with httpx.Client(timeout=10.0) as cb_client:
@@ -831,3 +868,153 @@ class OpenHandsCloudWorkspace(RemoteWorkspace):
                 logger.info(f"Completion callback sent ({status}): {resp.status_code}")
         except Exception as e:
             logger.warning(f"Completion callback failed: {e}")
+
+    # --- Repository Cloning Methods ---
+
+    def _get_secret_value(self, name: str) -> str | None:
+        """Fetch a secret value directly from the sandbox settings API.
+
+        Unlike get_secrets() which returns LookupSecret references, this method
+        fetches the actual secret value for use in operations like git cloning.
+        Retries up to 3 times on transient failures.
+
+        Args:
+            name: Name of the secret to fetch (e.g., "github_token", "gitlab_token")
+
+        Returns:
+            The secret value as a string, or None if not found or an error occurred.
+        """
+        if not self._sandbox_id or not self._session_api_key:
+            return None
+
+        # Validate secret name to prevent path traversal
+        if not name or "/" in name or ".." in name:
+            logger.warning(f"Invalid secret name: {name}")
+            return None
+
+        # Use retry logic for transient failures
+        @tenacity.retry(
+            stop=tenacity.stop_after_attempt(_MAX_RETRIES),
+            wait=tenacity.wait_exponential(multiplier=1, min=1, max=5),
+            retry=tenacity.retry_if_exception(_is_retryable_error),
+            reraise=True,
+        )
+        def _fetch_secret() -> httpx.Response:
+            return self._send_settings_request(
+                "GET", f"{self._settings_base_url}/secrets/{name}"
+            )
+
+        try:
+            resp = _fetch_secret()
+            return resp.text
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.debug(f"Secret '{name}' not found")
+            else:
+                logger.warning(f"Failed to fetch secret '{name}': {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Error fetching secret '{name}': {e}")
+            return None
+
+    # --- Repository Cloning and Skill Loading Methods ---
+    # These methods delegate to RemoteWorkspace but are explicitly defined here
+    # to maintain API compatibility (griffe detects method removal from subclass
+    # as a breaking change even when methods are inherited).
+
+    def clone_repos(
+        self,
+        repos: list[RepoSource | dict[str, Any] | str],
+        target_dir: str | Path | None = None,
+    ) -> CloneResult:
+        """Clone repositories to the workspace directory.
+
+        See RemoteWorkspace.clone_repos for full documentation.
+        """
+        return super().clone_repos(repos, target_dir)
+
+    def get_repos_context(self, repo_mappings: dict[str, RepoMapping]) -> str:
+        """Generate context string describing cloned repositories.
+
+        See RemoteWorkspace.get_repos_context for full documentation.
+        """
+        return super().get_repos_context(repo_mappings)
+
+    def load_skills_from_agent_server(
+        self,
+        project_dirs: list[str | Path] | None = None,
+        load_public: bool = True,
+        load_user: bool = True,
+        load_project: bool = True,
+        load_org: bool = True,
+        timeout: float = 60.0,
+    ) -> tuple[list[Skill], AgentContext]:
+        """Load skills from the agent server.
+
+        See RemoteWorkspace.load_skills_from_agent_server for full documentation.
+        """
+        return super().load_skills_from_agent_server(
+            project_dirs=project_dirs,
+            load_public=load_public,
+            load_user=load_user,
+            load_project=load_project,
+            load_org=load_org,
+            timeout=timeout,
+        )
+
+    def _call_skills_api(
+        self,
+        project_dir: str,
+        load_public: bool = False,
+        load_user: bool = False,
+        load_project: bool = False,
+        load_org: bool = False,
+        timeout: float = 60.0,
+    ) -> list[dict[str, Any]]:
+        """Call the agent-server /api/skills endpoint.
+
+        Returns list of skill dicts, or empty list on error.
+        Retries up to 3 times on transient failures.
+        """
+        payload = {
+            "load_public": load_public,
+            "load_user": load_user,
+            "load_project": load_project,
+            "load_org": load_org,
+            "project_dir": project_dir,
+            "org_config": None,
+            "sandbox_config": None,
+        }
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._session_api_key:
+            headers["X-Session-API-Key"] = self._session_api_key
+
+        # Use retry logic for transient failures
+        @tenacity.retry(
+            stop=tenacity.stop_after_attempt(_MAX_RETRIES),
+            wait=tenacity.wait_exponential(multiplier=1, min=1, max=5),
+            retry=tenacity.retry_if_exception(_is_retryable_error),
+            reraise=True,
+        )
+        def _fetch_skills() -> httpx.Response:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(
+                    f"{self.host}/api/skills",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return resp
+
+        try:
+            resp = _fetch_skills()
+            data = resp.json()
+            logger.debug(f"Agent-server sources: {data.get('sources', {})}")
+            return data.get("skills", [])
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Agent-server HTTP error {e.response.status_code}")
+            return []
+        except Exception as e:
+            logger.error(f"Failed to connect to agent-server: {e}")
+            return []

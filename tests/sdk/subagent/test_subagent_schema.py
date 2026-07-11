@@ -4,11 +4,10 @@ import pytest
 from pydantic import ValidationError
 
 from openhands.sdk.hooks.config import HookConfig
+from openhands.sdk.mcp.config import MCPServer, dump_mcp_config
 from openhands.sdk.subagent.schema import (
     AgentDefinition,
     _extract_examples,
-    _resolve_env_vars,
-    _resolve_env_vars_deep,
 )
 
 
@@ -375,24 +374,27 @@ Content.
         agent = AgentDefinition(name="test")
         assert agent.profile_store_dir is None
 
-    def test_mcp_servers_default_none(self):
-        """Test that mcp_servers defaults to None on direct construction."""
+    def test_mcp_config_default_none(self):
+        """Test that mcp_config defaults to None on direct construction."""
         agent = AgentDefinition(name="test")
-        assert agent.mcp_servers is None
+        assert agent.mcp_config is None
 
-    def test_mcp_servers_as_dict(self):
-        """Test creating AgentDefinition with mcp_servers as dict."""
-        servers = {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}
-        agent = AgentDefinition(name="mcp-agent", mcp_servers=servers)
-        assert agent.mcp_servers == servers
+    def test_mcp_config(self):
+        """Test creating AgentDefinition with typed MCP servers."""
+        servers = {"fetch": MCPServer(command="uvx", args=["mcp-server-fetch"])}
+        agent = AgentDefinition(name="mcp-agent", mcp_config=servers)
+        assert agent.mcp_config is not None
+        assert dump_mcp_config(agent.mcp_config) == {
+            "fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}
+        }
 
-    def test_load_mcp_servers_from_frontmatter(self, tmp_path: Path):
-        """Test loading mcp_servers from YAML frontmatter."""
+    def test_load_mcp_config_from_frontmatter(self, tmp_path: Path):
+        """Test loading mcp_config from YAML frontmatter."""
         agent_md = tmp_path / "mcp-agent.md"
         agent_md.write_text(
             """---
 name: mcp-agent
-mcp_servers:
+mcp_config:
   fetch:
     command: uvx
     args:
@@ -409,19 +411,20 @@ You are an agent with MCP tools.
         )
 
         agent = AgentDefinition.load(agent_md)
-        assert agent.mcp_servers is not None
-        assert "fetch" in agent.mcp_servers
-        assert agent.mcp_servers["fetch"]["command"] == "uvx"
-        assert agent.mcp_servers["fetch"]["args"] == ["mcp-server-fetch"]
-        assert "filesystem" in agent.mcp_servers
+        assert agent.mcp_config is not None
+        assert "fetch" in agent.mcp_config
+        servers = dump_mcp_config(agent.mcp_config)
+        assert servers["fetch"]["command"] == "uvx"
+        assert servers["fetch"]["args"] == ["mcp-server-fetch"]
+        assert "filesystem" in agent.mcp_config
 
-    def test_load_mcp_servers_not_in_metadata(self, tmp_path: Path):
-        """Test that mcp_servers doesn't leak into metadata."""
+    def test_load_mcp_config_not_in_metadata(self, tmp_path: Path):
+        """Test that mcp_config doesn't leak into metadata."""
         agent_md = tmp_path / "agent.md"
         agent_md.write_text(
             """---
 name: agent
-mcp_servers:
+mcp_config:
   fetch:
     command: uvx
     args:
@@ -433,11 +436,11 @@ Prompt.
 """
         )
         agent = AgentDefinition.load(agent_md)
-        assert "mcp_servers" not in agent.metadata
+        assert "mcp_config" not in agent.metadata
         assert agent.metadata.get("custom_field") == "value"
 
-    def test_load_without_mcp_servers(self, tmp_path: Path):
-        """Test that loading from file without mcp_servers gives None."""
+    def test_load_without_mcp_config(self, tmp_path: Path):
+        """Test that loading from file without mcp_config gives None."""
         agent_md = tmp_path / "agent.md"
         agent_md.write_text(
             """---
@@ -448,18 +451,15 @@ Prompt.
 """
         )
         agent = AgentDefinition.load(agent_md)
-        assert agent.mcp_servers is None
+        assert agent.mcp_config is None
 
-    def test_mcp_servers_env_vars_resolved_in_env_field(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        """Test that ${VAR} references in env values are resolved."""
-        monkeypatch.setenv("MY_API_KEY", "secret-123")
+    def test_mcp_config_env_vars_preserved_in_env_field(self, tmp_path: Path):
+        """Test that ${VAR} references in env values are preserved."""
         agent_md = tmp_path / "agent.md"
         agent_md.write_text(
             """---
 name: agent
-mcp_servers:
+mcp_config:
   my-server:
     command: npx
     args:
@@ -472,20 +472,19 @@ Prompt.
 """
         )
         agent = AgentDefinition.load(agent_md)
-        mcp_servers = agent.mcp_servers
-        assert mcp_servers is not None
-        assert mcp_servers["my-server"]["env"]["API_KEY"] == "secret-123"
+        mcp_config = agent.mcp_config
+        assert mcp_config is not None
+        dumped = dump_mcp_config(mcp_config)
+        # Placeholder preserved for runtime expansion with per-conversation secrets
+        assert dumped["my-server"]["env"]["API_KEY"] == "${MY_API_KEY}"
 
-    def test_mcp_servers_env_vars_resolved_in_command(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        """Test that ${VAR} references in command are resolved."""
-        monkeypatch.setenv("PLUGIN_ROOT", "/opt/plugins")
+    def test_mcp_config_env_vars_preserved_in_command(self, tmp_path: Path):
+        """Test that ${VAR} references in command are preserved."""
         agent_md = tmp_path / "agent.md"
         agent_md.write_text(
             """---
 name: agent
-mcp_servers:
+mcp_config:
   my-server:
     command: ${PLUGIN_ROOT}/bin/server
     args:
@@ -497,27 +496,25 @@ Prompt.
 """
         )
         agent = AgentDefinition.load(agent_md)
-        mcp_servers = agent.mcp_servers
-        assert mcp_servers is not None
-        assert mcp_servers["my-server"]["command"] == "/opt/plugins/bin/server"
-        assert mcp_servers["my-server"]["args"] == [
+        mcp_config = agent.mcp_config
+        assert mcp_config is not None
+        dumped = dump_mcp_config(mcp_config)
+        # Placeholders preserved for runtime expansion
+        assert dumped["my-server"]["command"] == "${PLUGIN_ROOT}/bin/server"
+        assert dumped["my-server"]["args"] == [
             "--config",
-            "/opt/plugins/config.json",
+            "${PLUGIN_ROOT}/config.json",
         ]
 
-    def test_mcp_servers_env_vars_resolved_in_url_and_headers(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        """Test that ${VAR} references in url and headers are resolved."""
-        monkeypatch.setenv("API_BASE", "https://api.example.com")
-        monkeypatch.setenv("AUTH_TOKEN", "tok-abc")
+    def test_mcp_config_env_vars_preserved_in_url_and_headers(self, tmp_path: Path):
+        """Test that ${VAR} references in url and headers are preserved."""
         agent_md = tmp_path / "agent.md"
         agent_md.write_text(
             """---
 name: agent
-mcp_servers:
+mcp_config:
   remote:
-    type: http
+    transport: http
     url: ${API_BASE}/mcp
     headers:
       Authorization: Bearer ${AUTH_TOKEN}
@@ -527,32 +524,31 @@ Prompt.
 """
         )
         agent = AgentDefinition.load(agent_md)
-        mcp_servers = agent.mcp_servers
-        assert mcp_servers is not None
-        assert mcp_servers["remote"]["url"] == "https://api.example.com/mcp"
-        assert mcp_servers["remote"]["headers"]["Authorization"] == "Bearer tok-abc"
+        mcp_config = agent.mcp_config
+        assert mcp_config is not None
+        dumped = dump_mcp_config(mcp_config)
+        # Placeholders preserved for runtime expansion
+        assert dumped["remote"]["url"] == "${API_BASE}/mcp"
+        assert dumped["remote"]["headers"]["Authorization"] == ("Bearer ${AUTH_TOKEN}")
 
-    def test_mcp_servers_unset_env_var_kept_as_is(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        """Test that unset ${VAR} references are left unchanged."""
-        monkeypatch.delenv("NONEXISTENT_VAR", raising=False)
+    def test_mcp_config_placeholders_preserved(self, tmp_path: Path):
+        """Test that all ${VAR} placeholders are preserved unchanged."""
         agent_md = tmp_path / "agent.md"
         agent_md.write_text(
             """---
 name: agent
-mcp_servers:
+mcp_config:
   my-server:
-    command: ${NONEXISTENT_VAR}
+    command: ${SOME_VAR}
 ---
 
 Prompt.
 """
         )
         agent = AgentDefinition.load(agent_md)
-        mcp_servers = agent.mcp_servers
-        assert mcp_servers is not None
-        assert mcp_servers["my-server"]["command"] == "${NONEXISTENT_VAR}"
+        mcp_config = agent.mcp_config
+        assert mcp_config is not None
+        assert dump_mcp_config(mcp_config)["my-server"]["command"] == "${SOME_VAR}"
 
     def test_permission_mode_defaults_to_none(self):
         """Test that permission_mode defaults to None (inherit parent)."""
@@ -688,87 +684,60 @@ class TestExtractExamples:
         assert "Multi" in examples[0]
 
 
-@pytest.mark.parametrize(
-    ("input_val", "env_vars", "expected"),
-    [
-        ("${FOO}", {"FOO": "bar"}, "bar"),
-        (
-            "${HOST}:${PORT}",
-            {"HOST": "localhost", "PORT": "8080"},
-            "localhost:8080",
-        ),
-        ("prefix_${VAR}_suffix", {"VAR": "mid"}, "prefix_mid_suffix"),
-        ("plain text", {}, "plain text"),
-        ("${MISSING}", {}, "${MISSING}"),
-        ("$FOO", {"FOO": "bar"}, "bar"),
-        ("$FOO/path", {"FOO": "/root"}, "/root/path"),
-    ],
-    ids=[
-        "single_var",
-        "multiple_vars",
-        "var_embedded_in_text",
-        "no_vars",
-        "unset_var_unchanged",
-        "dollar_without_braces",
-        "dollar_without_braces_in_path",
-    ],
-)
-def test_resolve_env_vars(
-    monkeypatch: pytest.MonkeyPatch,
-    input_val: str,
-    env_vars: dict[str, str],
-    expected: str,
-):
-    for k, v in env_vars.items():
-        monkeypatch.setenv(k, v)
-    assert _resolve_env_vars(input_val) == expected
+class TestAgentDefinitionCondenser:
+    """Tests for the condenser frontmatter field."""
+
+    def test_condenser_absent_is_none(self, tmp_path: Path):
+        agent_md = tmp_path / "a.md"
+        agent_md.write_text("---\nname: a\n---\n\nPrompt.\n")
+        assert AgentDefinition.load(agent_md).condenser is None
+
+    def test_condenser_none_disables(self, tmp_path: Path):
+        from openhands.sdk.context.condenser import NoOpCondenser
+
+        agent_md = tmp_path / "a.md"
+        agent_md.write_text("---\nname: a\ncondenser: none\n---\n\nPrompt.\n")
+        assert isinstance(AgentDefinition.load(agent_md).condenser, NoOpCondenser)
+
+    def test_condenser_false_disables(self, tmp_path: Path):
+        from openhands.sdk.context.condenser import NoOpCondenser
+
+        agent_md = tmp_path / "a.md"
+        agent_md.write_text("---\nname: a\ncondenser: false\n---\n\nPrompt.\n")
+        assert isinstance(AgentDefinition.load(agent_md).condenser, NoOpCondenser)
+
+    def test_condenser_invalid_string_raises(self, tmp_path: Path):
+        agent_md = tmp_path / "a.md"
+        agent_md.write_text("---\nname: a\ncondenser: bogus\n---\n\nPrompt.\n")
+        with pytest.raises(ValueError, match="Invalid condenser value"):
+            AgentDefinition.load(agent_md)
+
+    def test_condenser_not_in_metadata(self, tmp_path: Path):
+        """condenser is a known field, not leaked into metadata extras."""
+        agent_md = tmp_path / "a.md"
+        agent_md.write_text("---\nname: a\ncondenser: none\n---\n\nPrompt.\n")
+        assert "condenser" not in AgentDefinition.load(agent_md).metadata
 
 
-@pytest.mark.parametrize(
-    ("input_val", "expected"),
-    [
-        (42, 42),
-        (None, None),
-        (True, True),
-        (3.14, 3.14),
-    ],
-    ids=["int", "none", "bool", "float"],
-)
-def test_resolve_env_vars_deep_non_string_passthrough(
-    input_val: object, expected: object
-):
-    assert _resolve_env_vars_deep(input_val) is expected
+class TestAgentDefinitionMaxBudget:
+    """Tests for the max_budget_per_run frontmatter field."""
 
+    def test_absent_is_none(self, tmp_path: Path):
+        md = tmp_path / "a.md"
+        md.write_text("---\nname: a\n---\n\nPrompt.\n")
+        assert AgentDefinition.load(md).max_budget_per_run is None
 
-def test_resolve_env_vars_deep_string(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("VAL", "resolved")
-    assert _resolve_env_vars_deep("${VAL}") == "resolved"
+    def test_numeric_value(self, tmp_path: Path):
+        md = tmp_path / "a.md"
+        md.write_text("---\nname: a\nmax_budget_per_run: 2.5\n---\n\nPrompt.\n")
+        assert AgentDefinition.load(md).max_budget_per_run == 2.5
 
+    def test_string_value(self, tmp_path: Path):
+        md = tmp_path / "a.md"
+        md.write_text('---\nname: a\nmax_budget_per_run: "1.0"\n---\n\nPrompt.\n')
+        assert AgentDefinition.load(md).max_budget_per_run == 1.0
 
-def test_resolve_env_vars_deep_dict(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("A", "1")
-    monkeypatch.setenv("B", "2")
-    result = _resolve_env_vars_deep({"key_a": "${A}", "key_b": "${B}"})
-    assert result == {"key_a": "1", "key_b": "2"}
-
-
-def test_resolve_env_vars_deep_list(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("X", "hello")
-    result = _resolve_env_vars_deep(["${X}", "literal", "${X}"])
-    assert result == ["hello", "literal", "hello"]
-
-
-def test_resolve_env_vars_deep_nested(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CMD", "/usr/bin/server")
-    monkeypatch.setenv("TOKEN", "secret")
-    data = {
-        "command": "${CMD}",
-        "args": ["--token", "${TOKEN}"],
-        "env": {"API_TOKEN": "${TOKEN}"},
-        "port": 8080,
-    }
-    result = _resolve_env_vars_deep(data)
-    assert result["command"] == "/usr/bin/server"
-    assert result["args"] == ["--token", "secret"]
-    assert result["env"]["API_TOKEN"] == "secret"
-    assert result["port"] == 8080  # non-string left untouched
+    def test_not_in_metadata(self, tmp_path: Path):
+        md = tmp_path / "a.md"
+        md.write_text("---\nname: a\nmax_budget_per_run: 3\n---\n\nPrompt.\n")
+        assert "max_budget_per_run" not in AgentDefinition.load(md).metadata

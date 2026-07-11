@@ -1,7 +1,8 @@
 """Test agent JSON serialization with DiscriminatedUnionMixin."""
 
 import json
-from typing import cast
+from collections.abc import Mapping
+from typing import Any
 from unittest.mock import Mock
 
 import mcp.types
@@ -12,9 +13,23 @@ from openhands.sdk.agent import Agent
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.llm import LLM
 from openhands.sdk.mcp.client import MCPClient
+from openhands.sdk.mcp.config import coerce_mcp_config, dump_mcp_config
 from openhands.sdk.mcp.tool import MCPToolDefinition
 from openhands.sdk.tool.tool import ToolDefinition
 from openhands.sdk.utils.models import OpenHandsModel
+
+
+def mcp_config_model(config: Mapping[str, object]):
+    servers = (
+        config.get("mcpServers")
+        if isinstance(config.get("mcpServers"), dict)
+        else config
+    )
+    return coerce_mcp_config(servers)
+
+
+def dump_agent_mcp_config(agent: AgentBase) -> dict[str, dict[str, Any]]:
+    return dump_mcp_config(agent.mcp_config)
 
 
 def create_mock_mcp_tool(name: str) -> MCPToolDefinition:
@@ -59,27 +74,212 @@ def test_mcp_tool_serialization():
     assert loaded.model_dump_json() == dumped
 
 
-def test_agent_serialization_should_include_mcp_tool() -> None:
-    # Create a simple LLM instance and agent with empty tools
+def test_agent_serialization_redacts_mcp_config_by_default() -> None:
+    """MCP SecretStr values are redacted during default serialization."""
     llm = LLM(model="test-model", usage_id="test-llm")
-    mcp_config = {
+    config = {
         "mcpServers": {
-            "dummy": {"command": "echo", "args": ["dummy-mcp"]},
+            "dummy": {
+                "command": "echo",
+                "args": ["dummy-mcp"],
+                "env": {"API_KEY": "super-secret-key", "DEBUG": "true"},
+                "headers": {"Authorization": "Bearer secret-token"},
+            },
         }
     }
-    agent = Agent(llm=llm, tools=[], mcp_config=cast(dict[str, object], mcp_config))
+    agent = Agent(llm=llm, tools=[], mcp_config=mcp_config_model(config))
 
-    # Serialize to JSON (excluding non-serializable fields)
-    agent_dump = agent.model_dump()
-    assert agent_dump.get("mcp_config") == mcp_config
-    agent_json = agent.model_dump_json()
+    # mcp_config should be accessible in memory with full secrets
+    assert dump_agent_mcp_config(agent) == config["mcpServers"]
+    dumped_env = dump_agent_mcp_config(agent)["dummy"]["env"]
+    assert isinstance(dumped_env, dict)
+    assert dumped_env["API_KEY"] == "super-secret-key"
 
-    # Deserialize from JSON using the base class
+    agent_dump = agent.model_dump(mode="json")
+    serialized = json.dumps(agent_dump)
+    assert "super-secret-key" not in serialized
+    assert "secret-token" not in serialized
+    server = agent_dump["mcp_config"]["dummy"]
+    assert isinstance(server["env"], dict)
+    assert isinstance(server["headers"], dict)
+    assert server["env"]["API_KEY"] == "**********"
+    assert server["headers"]["Authorization"] == "**********"
+
+
+def test_agent_serialization_exposes_mcp_config_with_expose_secrets() -> None:
+    """Test that mcp_config is exposed when expose_secrets=True."""
+    llm = LLM(model="test-model", usage_id="test-llm")
+    config = {
+        "mcpServers": {
+            "dummy": {
+                "command": "echo",
+                "args": ["dummy-mcp"],
+                "env": {"API_KEY": "super-secret-key"},
+            },
+        }
+    }
+    agent = Agent(llm=llm, tools=[], mcp_config=mcp_config_model(config))
+
+    # With expose_secrets=True, mcp_config should be returned as-is
+    agent_dump = agent.model_dump(mode="json", context={"expose_secrets": True})
+    server = agent_dump["mcp_config"]["dummy"]
+    assert isinstance(server["env"], dict)
+    assert server["command"] == "echo"
+    assert server["args"] == ["dummy-mcp"]
+    assert server["env"]["API_KEY"] == "super-secret-key"
+
+    # Round-trip should preserve the config
+    agent_json = agent.model_dump_json(context={"expose_secrets": True})
     deserialized_agent = AgentBase.model_validate_json(agent_json)
-
-    # Should deserialize to the correct type and have same core fields
     assert isinstance(deserialized_agent, Agent)
-    assert deserialized_agent.model_dump_json() == agent.model_dump_json()
+    assert dump_agent_mcp_config(deserialized_agent) == config["mcpServers"]
+
+
+def test_agent_serialization_encrypts_mcp_config_with_cipher() -> None:
+    """MCP SecretStr values are encrypted when cipher context is provided."""
+    from openhands.sdk.utils.cipher import Cipher
+
+    llm = LLM(model="test-model", usage_id="test-llm")
+    config = {
+        "mcpServers": {
+            "dummy": {
+                "command": "echo",
+                "args": ["dummy-mcp"],
+                "env": {"API_KEY": "super-secret-key"},
+            },
+        }
+    }
+    agent = Agent(llm=llm, tools=[], mcp_config=mcp_config_model(config))
+    cipher = Cipher(secret_key="test-encryption-key")
+
+    agent_dump = agent.model_dump(mode="json", context={"cipher": cipher})
+    env = agent_dump["mcp_config"]["dummy"]["env"]
+    assert isinstance(env, dict)
+    encrypted = env["API_KEY"]
+    assert isinstance(encrypted, str)
+    assert encrypted != "super-secret-key"
+    decrypted = cipher.decrypt(encrypted)
+    assert decrypted is not None
+    assert decrypted.get_secret_value() == "super-secret-key"
+
+
+def test_agent_mcp_config_encryption_decryption_roundtrip() -> None:
+    """Test full roundtrip: encrypt on serialize, decrypt on deserialize."""
+    from openhands.sdk.utils.cipher import Cipher
+
+    llm = LLM(model="test-model", usage_id="test-llm")
+    config = {
+        "mcpServers": {
+            "fetch": {"command": "uvx", "args": ["mcp-fetch"]},
+            "git": {
+                "command": "uvx",
+                "args": ["mcp-git", "--repo", "/tmp/test"],
+                "env": {"GIT_TOKEN": "git-secret"},
+            },
+        }
+    }
+    agent = Agent(llm=llm, tools=[], mcp_config=mcp_config_model(config))
+    cipher = Cipher(secret_key="test-encryption-key-roundtrip")
+
+    # Serialize with cipher
+    agent_json = agent.model_dump_json(context={"cipher": cipher})
+
+    # Deserialize with same cipher
+    restored_agent = AgentBase.model_validate_json(
+        agent_json, context={"cipher": cipher}
+    )
+
+    # mcp_config should be restored correctly
+    assert isinstance(restored_agent, Agent)
+    assert dump_agent_mcp_config(restored_agent) == config["mcpServers"]
+
+
+def test_agent_mcp_config_accepts_plaintext_dict() -> None:
+    mcp_config = {"fetch": {"command": "uvx", "args": ["fetch"]}}
+    agent_dict = {
+        "llm": {"model": "test-model", "usage_id": "test-llm"},
+        "tools": [],
+        "mcp_config": mcp_config,
+        "kind": "Agent",
+    }
+
+    # Deserialize - should work without cipher
+    agent = AgentBase.model_validate(agent_dict)
+
+    assert isinstance(agent, Agent)
+    assert dump_agent_mcp_config(agent) == mcp_config
+
+
+def test_agent_mcp_config_decrypts_nested_env_and_headers_with_cipher() -> None:
+    """Encrypted per-value MCP env/header settings decrypt at agent validation."""
+    from pydantic import SecretStr
+
+    from openhands.sdk.utils.cipher import Cipher
+
+    cipher = Cipher(secret_key="test-per-value-mcp-key")
+    encrypted_env = cipher.encrypt(SecretStr("ghp-plaintext-token"))
+    encrypted_header = cipher.encrypt(SecretStr("Bearer plaintext-token"))
+    agent_dict = {
+        "llm": {"model": "test-model", "usage_id": "test-llm"},
+        "tools": [],
+        "mcp_config": {
+            "github": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": encrypted_env,
+                    "DEBUG": "true",
+                    "PORT": "1234",
+                },
+                "headers": {"Authorization": encrypted_header},
+            }
+        },
+        "kind": "Agent",
+    }
+
+    agent = AgentBase.model_validate(agent_dict, context={"cipher": cipher})
+
+    assert isinstance(agent, Agent)
+    server = dump_agent_mcp_config(agent)["github"]
+    env = server["env"]
+    headers = server["headers"]
+    assert isinstance(env, dict)
+    assert isinstance(headers, dict)
+    assert env["GITHUB_PERSONAL_ACCESS_TOKEN"] == "ghp-plaintext-token"
+    assert env["DEBUG"] == "true"
+    assert env["PORT"] == "1234"
+    assert headers["Authorization"] == "Bearer plaintext-token"
+    assert (
+        agent_dict["mcp_config"]["github"]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"]
+        == encrypted_env
+    )
+
+
+def test_agent_mcp_config_rejects_non_dict_plaintext_config() -> None:
+    agent_dict = {
+        "llm": {"model": "test-model", "usage_id": "test-llm"},
+        "tools": [],
+        "mcp_config": [],
+        "kind": "Agent",
+    }
+
+    with pytest.raises(ValueError, match="Input should be a valid dictionary"):
+        AgentBase.model_validate(agent_dict)
+
+
+def test_agent_mcp_config_rejects_malformed_secret_containers() -> None:
+    from openhands.sdk.utils.cipher import Cipher
+
+    cipher = Cipher(secret_key="test-per-value-mcp-key")
+    agent_dict = {
+        "llm": {"model": "test-model", "usage_id": "test-llm"},
+        "tools": [],
+        "mcp_config": {"github": {"env": "not-a-dict"}},
+        "kind": "Agent",
+    }
+
+    with pytest.raises(ValueError, match=r"mcp_config\.github\.env"):
+        AgentBase.model_validate(agent_dict, context={"cipher": cipher})
 
 
 def test_agent_supports_polymorphic_field_json_serialization() -> None:
